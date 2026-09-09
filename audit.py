@@ -1,37 +1,60 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 import pandas as pd
-import streamlit as st
-from helpers import clean_eta_series, display_df, find_first_col, find_sheet_with_required_cols, format_pct_str, normalize_mawb, parse_mawb_list, pct, safe_numeric
 
-BILLING_REQUIRED = {
-    'MAWB': ['MAWB','Mawb','Master AWB','MasterAWB'],
-    'Cost Amount': ['Cost Amount','Cost','AP Amount','Total Cost','CostAmount','AP'],
-    'Sell Amount': ['Sell Amount','Sell','AR Amount','Total Sell','SellAmount','AR'],
+from helpers import (
+    safe_numeric,
+    normalize_mawb,
+    parse_mawb_list,
+    pct,
+    clean_eta_series,
+    display_df
+)
+
+
+# ============================================================
+# BUSINESS RULES
+# ============================================================
+
+HANCAI_ALLOC_CODES = {
+    "DTRF",
+    "TISC",
+    "TABD",
+    "DSTOR",
+    "WIO"
 }
-BILLING_OPTIONAL = {
-    'Client': ['Client','Customer','Account','Shipper','Bill To','Billed To'],
-    'Charge Code': ['Charge Code','ChargeCode','Charge','Code'],
-    'Vendor': ['Vendor','Carrier','Supplier'],
+
+HANCAI_THAWB_ONLY_CODES = {
+    "THAWB",
+    "DDOC"
 }
-ETA_REQUIRED = {
-    'MAWB': ['MAWB','Mawb','Master AWB','MasterAWB'],
-    'ETA': ['ETA','Eta','Estimated Time of Arrival','Arrival','Arrival Date','ETA Date'],
+
+HANCAI_SPECIAL_CLIENTS = {
+    "HANCAIWUX",
+    "4PXDIGHKG"
 }
-ETA_OPTIONAL = {'Branch': ['Branch','Destination','Dest','Station']}
-HANCAI_ALLOC_CODES = {'DTRF','TISC','TABD','DSTOR','WIO'}
-HANCAI_THAWB_ONLY_CODES = {'THAWB','DDOC'}
-HANCAI_SPECIAL_CLIENTS = {'HANCAIWUX','4PXDIGHKG'}
-SHELIU_SPECIAL_CLIENTS = {'SHELIUSZX','LIBEXPLHR'}
+
+SHELIU_SPECIAL_CLIENTS = {
+    "SHELIUSZX",
+    "LIBEXPLHR"
+}
+
+
+# ============================================================
+# RESULT OBJECT
+# ============================================================
 
 @dataclass
 class AuditResult:
+
     mawb_keep: list[str]
-    mawb_not_found: list[str]
     mawb_not_found_df: pd.DataFrame
     eta_parse_note: str | None
+
     kpi_vertical: pd.DataFrame
     neg_summary: pd.DataFrame
+
     df: pd.DataFrame
     summary: pd.DataFrame
     exceptions: pd.DataFrame
@@ -46,7 +69,7 @@ class AuditResult:
     chargecode_summary: pd.DataFrame
     vendor_summary: pd.DataFrame
     chargecode_profit_lt0_mawb: pd.DataFrame
-    margin_label: str
+
     display_summary: pd.DataFrame
     display_exceptions: pd.DataFrame
     display_client_summary: pd.DataFrame
@@ -62,236 +85,1362 @@ class AuditResult:
     display_chargecode_profit_lt0_mawb: pd.DataFrame
 
 
-def _clean_text(s: pd.Series, default='UNKNOWN') -> pd.Series:
-    out = s.astype(str).str.strip().str.upper()
-    return out.replace({'':default,'NAN':default,'NONE':default,'<NA>':default})
+# ============================================================
+# CLEAN TEXT
+# ============================================================
+
+def _clean_text(
+    series: pd.Series,
+    default="UNKNOWN"
+) -> pd.Series:
+
+    out = (
+        series
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    return out.mask(
+        out.eq(""),
+        default
+    )
 
 
-def _parts(mawb: str) -> tuple[str,str]:
-    m = normalize_mawb(mawb)
-    return (m[:3], m[-8:]) if len(m)==12 and m[3]=='-' else ('','')
+# ============================================================
+# READ NEW BILLING FORMAT
+# ============================================================
+
+def _prepare_billing(file) -> pd.DataFrame:
+
+    raw = pd.read_excel(
+        file,
+        sheet_name=0
+    )
+
+    required = [
+        "MAWB",
+        "Charge Code",
+        "Cost Amount",
+        "Sell Amount"
+    ]
+
+    missing = [
+        c for c in required
+        if c not in raw.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Billing file is missing required columns: "
+            + ", ".join(missing)
+        )
+
+    df = raw.copy()
+
+    # ----------------------------
+    # MAWB
+    # ----------------------------
+
+    df["MAWB"] = (
+        df["MAWB"]
+        .apply(normalize_mawb)
+    )
+
+    df = df[
+        df["MAWB"].ne("")
+    ].copy()
+
+    # ----------------------------
+    # AP / AR
+    # ----------------------------
+
+    df["Cost Amount"] = safe_numeric(
+        df["Cost Amount"]
+    )
+
+    df["Sell Amount"] = safe_numeric(
+        df["Sell Amount"]
+    )
+
+    # ----------------------------
+    # CHARGE CODE
+    # ----------------------------
+
+    df["Charge Code"] = _clean_text(
+        df["Charge Code"]
+    )
+
+    # ----------------------------
+    # CLIENT
+    #
+    # New file has both:
+    # Client
+    # Debtor
+    #
+    # Client first.
+    # If Client blank -> Debtor.
+    # ----------------------------
+
+    if "Client" in df.columns:
+
+        client = (
+            df["Client"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+    else:
+
+        client = pd.Series(
+            "",
+            index=df.index
+        )
+
+    if "Debtor" in df.columns:
+
+        debtor = (
+            df["Debtor"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+        client = client.mask(
+            client.eq(""),
+            debtor
+        )
+
+    df["Client"] = _clean_text(
+        client
+    )
+
+    # ----------------------------
+    # VENDOR
+    # ----------------------------
+
+    if "Vendor" in df.columns:
+
+        df["Vendor"] = _clean_text(
+            df["Vendor"]
+        )
+
+    else:
+
+        df["Vendor"] = "UNKNOWN"
+
+    # Keep original MAWB for reference
+    df["Original MAWB"] = df["MAWB"]
+
+    return df
 
 
-def _build_procaresx_map(df: pd.DataFrame) -> dict[str,str]:
-    pro = df.loc[df['Client'].eq('PROCARESX'), ['MAWB']].drop_duplicates()
-    if pro.empty:
-        return {}
-    p = pro['MAWB'].apply(_parts)
-    pro = pro.assign(Prefix=p.str[0], Last8=p.str[1])
-    groups = pro[pro['Last8'].ne('')].groupby('Last8')['Prefix'].agg(set).to_dict()
+# ============================================================
+# PROCARESX MAWB MERGE
+#
+# PRIORITY:
+#
+# 125 > 932 > 001
+#
+# 777 merges into existing main MAWB.
+# ============================================================
+
+def _procaresx_map(
+    df: pd.DataFrame
+) -> dict[str, str]:
+
+    pro = (
+        df.loc[
+            df["Client"].eq("PROCARESX"),
+            "MAWB"
+        ]
+        .drop_duplicates()
+    )
+
+    buckets: dict[str, set[str]] = {}
+
+    for mawb in pro:
+
+        if (
+            len(mawb) == 12
+            and mawb[3] == "-"
+        ):
+
+            last8 = mawb[-8:]
+            prefix = mawb[:3]
+
+            buckets.setdefault(
+                last8,
+                set()
+            ).add(prefix)
+
     mapping = {}
-    for last8, prefixes in groups.items():
-        target = '125' if '125' in prefixes else ('932' if '932' in prefixes else ('001' if '001' in prefixes else ''))
-        if target and '777' in prefixes:
-            mapping[f'777-{last8}'] = f'{target}-{last8}'
+
+    for last8, prefixes in buckets.items():
+
+        target = None
+
+        # Priority
+        for prefix in (
+            "125",
+            "932",
+            "001"
+        ):
+
+            if prefix in prefixes:
+                target = prefix
+                break
+
+        if (
+            target
+            and "777" in prefixes
+        ):
+
+            mapping[
+                f"777-{last8}"
+            ] = (
+                f"{target}-{last8}"
+            )
+
     return mapping
 
 
-def _apply_procaresx_merge(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str,str]]:
+def _apply_procaresx_merge(
+    df: pd.DataFrame
+):
+
     out = df.copy()
-    mapping = _build_procaresx_map(out)
-    if mapping:
-        mask = out['Client'].eq('PROCARESX')
-        out.loc[mask, 'MAWB'] = out.loc[mask, 'MAWB'].replace(mapping)
+
+    mapping = _procaresx_map(
+        out
+    )
+
+    mask = (
+        out["Client"]
+        .eq("PROCARESX")
+    )
+
+    out.loc[
+        mask,
+        "MAWB"
+    ] = (
+        out.loc[
+            mask,
+            "MAWB"
+        ]
+        .replace(mapping)
+    )
+
     return out, mapping
 
 
-def _apply_hancai_allocation(df: pd.DataFrame) -> pd.DataFrame:
+# ============================================================
+# HANCAIWUX AR ALLOCATION
+#
+# DTRF / TISC / TABD / DSTOR / WIO
+#
+# AR is stored in DTRF.
+#
+# Allocate DTRF AR according to AP share.
+# ============================================================
+
+def _apply_hancai_allocation(
+    df: pd.DataFrame
+) -> pd.DataFrame:
+
     out = df.copy()
-    out['Original Sell Amount'] = out['Sell Amount']
-    out['AR Allocation Applied'] = False
-    mask = out['Client'].eq('HANCAIWUX') & out['Charge Code'].isin(HANCAI_ALLOC_CODES)
-    for _, idx in out.loc[mask].groupby('MAWB').groups.items():
+
+    out[
+        "Original Sell Amount"
+    ] = out["Sell Amount"]
+
+    out[
+        "AR Allocation Applied"
+    ] = False
+
+    eligible = (
+        out["Client"].eq(
+            "HANCAIWUX"
+        )
+        &
+        out["Charge Code"].isin(
+            HANCAI_ALLOC_CODES
+        )
+    )
+
+    grouped = (
+        out.loc[eligible]
+        .groupby("MAWB")
+        .groups
+    )
+
+    for mawb, idx in grouped.items():
+
         rows = out.loc[idx]
-        if not rows['Charge Code'].eq('DTRF').any():
+
+        # Must have DTRF
+        if not rows[
+            "Charge Code"
+        ].eq("DTRF").any():
+
             continue
-        total_ap = float(rows['Cost Amount'].sum())
-        dtrf_ar = float(rows.loc[rows['Charge Code'].eq('DTRF'),'Sell Amount'].sum())
+
+        # Total AP of:
+        # DTRF/TISC/TABD/DSTOR/WIO
+
+        total_ap = (
+            rows["Cost Amount"]
+            .sum()
+        )
+
+        # AR currently stored in DTRF
+
+        dtrf_ar = (
+            rows.loc[
+                rows["Charge Code"].eq(
+                    "DTRF"
+                ),
+                "Sell Amount"
+            ]
+            .sum()
+        )
+
         if total_ap <= 0:
             continue
-        out.loc[idx,'Sell Amount'] = dtrf_ar * rows['Cost Amount'] / total_ap
-        out.loc[idx,'AR Allocation Applied'] = True
+
+        allocation = (
+            dtrf_ar
+            *
+            rows["Cost Amount"]
+            /
+            total_ap
+        )
+
+        out.loc[
+            idx,
+            "Sell Amount"
+        ] = allocation
+
+        out.loc[
+            idx,
+            "AR Allocation Applied"
+        ] = True
+
     return out
 
 
-def _read_eta(eta_file):
-    if eta_file is None:
+# ============================================================
+# ETA / BRANCH
+# ============================================================
+
+def _read_eta(
+    file,
+    pro_mapping
+):
+
+    if file is None:
         return None, None
-    xls = pd.ExcelFile(eta_file)
-    sh = find_sheet_with_required_cols(xls, ETA_REQUIRED)
-    if not sh:
-        return None, 'ETA mapping file uploaded, but no sheet with MAWB and ETA was found.'
-    raw = pd.read_excel(xls, sheet_name=sh)
-    mcol = find_first_col(raw, ETA_REQUIRED['MAWB'])
-    ecol = find_first_col(raw, ETA_REQUIRED['ETA'])
-    bcol = find_first_col(raw, ETA_OPTIONAL['Branch'])
-    cols = [mcol, ecol] + ([bcol] if bcol else [])
-    m = raw[cols].copy().rename(columns={mcol:'MAWB', ecol:'ETA', **({bcol:'Branch'} if bcol else {})})
-    m['MAWB'] = m['MAWB'].apply(normalize_mawb)
-    m['ETA'] = clean_eta_series(m['ETA'])
-    m['Branch'] = m['Branch'].astype(str).str.strip().replace({'nan':'','None':''}) if 'Branch' in m.columns else ''
-    bad = int(m['ETA'].isna().sum())
-    note = f'ETA parsing note: {bad} / {len(m)} ETA values could not be parsed and were left blank.' if len(m) and bad else None
-    m = m[m['MAWB'].ne('')].groupby('MAWB', as_index=False).agg(ETA=('ETA','max'), Branch=('Branch','last'))
-    return m, note
+
+    eta = pd.read_excel(
+        file,
+        sheet_name=0
+    )
+
+    if (
+        "MAWB" not in eta.columns
+        or "ETA" not in eta.columns
+    ):
+
+        return (
+            None,
+            "ETA file must contain MAWB and ETA columns."
+        )
+
+    keep = [
+        "MAWB",
+        "ETA"
+    ]
+
+    if "Branch" in eta.columns:
+        branch_col = "Branch"
+
+    elif "Destination" in eta.columns:
+        branch_col = "Destination"
+
+    else:
+        branch_col = None
+
+    if branch_col:
+        keep.append(
+            branch_col
+        )
+
+    eta = eta[
+        keep
+    ].copy()
+
+    eta["MAWB"] = (
+        eta["MAWB"]
+        .apply(normalize_mawb)
+        .replace(pro_mapping)
+    )
+
+    eta["ETA"] = clean_eta_series(
+        eta["ETA"]
+    )
+
+    if branch_col:
+
+        eta["Branch"] = (
+            eta[branch_col]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+    else:
+
+        eta["Branch"] = ""
+
+    eta = (
+        eta.groupby(
+            "MAWB",
+            as_index=False
+        )
+        .agg(
+            ETA=("ETA", "max"),
+            Branch=("Branch", "last")
+        )
+    )
+
+    return eta, None
 
 
-def _active_codes(df: pd.DataFrame) -> dict[str,set[str]]:
-    active = df.loc[df['Cost Amount'].ne(0) | df['Sell Amount'].ne(0), ['MAWB','Charge Code']].drop_duplicates()
-    return active.groupby('MAWB')['Charge Code'].agg(set).to_dict()
+# ============================================================
+# ACTIVE CHARGE CODES
+# ============================================================
+
+def _active_codes(
+    df: pd.DataFrame
+):
+
+    active = df.loc[
+        (
+            df["Cost Amount"].ne(0)
+        )
+        |
+        (
+            df["Sell Amount"].ne(0)
+        ),
+        [
+            "MAWB",
+            "Charge Code"
+        ]
+    ].drop_duplicates()
+
+    return (
+        active
+        .groupby("MAWB")[
+            "Charge Code"
+        ]
+        .agg(
+            lambda x: set(x)
+        )
+        .to_dict()
+    )
 
 
-def _classify(row, codes, low_thr, high_thr):
-    client = str(row['Client']).upper()
-    profit, pm = float(row['Profit']), float(row['Profit Margin %'])
-    cost, sell = float(row['Total_Cost']), float(row['Total_Sell'])
+# ============================================================
+# MAWB CLASSIFICATION
+# ============================================================
+
+def _classify(
+    row,
+    codes,
+    low_thr,
+    high_thr
+):
+
+    client = row["Client"]
+
+    profit = float(
+        row["Profit"]
+    )
+
+    margin = float(
+        row["Profit Margin %"]
+    )
+
+    cost = float(
+        row["Total_Cost"]
+    )
+
+    sell = float(
+        row["Total_Sell"]
+    )
+
+    # ========================================================
+    # HIGHEST PRIORITY
+    # ========================================================
+
     if profit < 0:
-        return 'Exception','Open','Profit<0'
-    if cost == 0 and sell == 0:
-        return 'Exception','Open','Cost=Sell=0'
+
+        return (
+            "Exception",
+            "Open",
+            "Profit<0"
+        )
+
+    # ========================================================
+    # ZERO CONDITIONS
+    # ========================================================
+
+    if (
+        cost == 0
+        and sell == 0
+    ):
+
+        return (
+            "Exception",
+            "Open",
+            "Cost=Sell=0"
+        )
+
     if sell == 0:
-        return 'Exception','Open','Revenue=0'
+
+        return (
+            "Exception",
+            "Open",
+            "Revenue=0"
+        )
+
     if cost == 0:
-        return 'Exception','Open','Cost=0'
-    if client in HANCAI_SPECIAL_CLIENTS and codes and codes.issubset(HANCAI_THAWB_ONLY_CODES):
-        return ('Exception','Open','Margin<85%') if pm < .85 else ('Exempt','Closed','THAWB/DDOC Margin>=85%')
-    if client in SHELIU_SPECIAL_CLIENTS and 'THAWB' not in codes:
-        return ('Exception','Open','Margin>35%') if pm > .35 else ('Exempt','Closed','No THAWB Margin<=35%')
-    if pm > high_thr:
-        return 'Exception','Open',f'Margin>{int(high_thr*100)}%'
-    if pm < low_thr:
-        return 'Exception','Open',f'Margin<{int(low_thr*100)}%'
-    return 'Normal','Closed',''
+
+        return (
+            "Exception",
+            "Open",
+            "Cost=0"
+        )
+
+    # ========================================================
+    # HANCAIWUX / 4PXDIGHKG
+    #
+    # Only THAWB / DDOC active
+    # ========================================================
+
+    if (
+        client
+        in HANCAI_SPECIAL_CLIENTS
+        and codes
+        and codes.issubset(
+            HANCAI_THAWB_ONLY_CODES
+        )
+    ):
+
+        if margin < 0.85:
+
+            return (
+                "Exception",
+                "Open",
+                "Margin<85%"
+            )
+
+        return (
+            "Exempt",
+            "Closed",
+            "THAWB/DDOC Margin>=85%"
+        )
+
+    # ========================================================
+    # SHELIUSZX / LIBEXPLHR
+    #
+    # THAWB absent
+    # ========================================================
+
+    if (
+        client
+        in SHELIU_SPECIAL_CLIENTS
+        and "THAWB" not in codes
+    ):
+
+        if margin > 0.35:
+
+            return (
+                "Exception",
+                "Open",
+                "Margin>35%"
+            )
+
+        return (
+            "Exempt",
+            "Closed",
+            "No THAWB Margin<=35%"
+        )
+
+    # ========================================================
+    # DEFAULT RULE
+    # ========================================================
+
+    if margin > high_thr:
+
+        return (
+            "Exception",
+            "Open",
+            f"Margin>{int(high_thr * 100)}%"
+        )
+
+    if margin < low_thr:
+
+        return (
+            "Exception",
+            "Open",
+            f"Margin<{int(low_thr * 100)}%"
+        )
+
+    return (
+        "Normal",
+        "Closed",
+        ""
+    )
 
 
-def _pivot(relation, key, flags):
-    joined = relation.drop_duplicates().merge(flags, on='MAWB', how='left')
-    if joined.empty:
-        return pd.DataFrame({key:[]})
-    p = joined.pivot_table(index=key, columns='Exception_Type', values='MAWB', aggfunc=pd.Series.nunique, fill_value=0).reset_index()
-    p.columns.name = None
-    return p
+# ============================================================
+# MAIN AUDIT
+# ============================================================
 
+def run_audit(
+    billing_file,
+    eta_file=None,
+    mawb_text="",
+    low_thr=0.30,
+    high_thr=0.80
+) -> AuditResult:
 
-def _kpi(metrics, pct_keys):
-    return pd.DataFrame([{'Metric':k,'Value':format_pct_str(v) if k in pct_keys else v} for k,v in metrics.items()])
+    # ========================================================
+    # 1. READ BILLING
+    # ========================================================
 
+    df = _prepare_billing(
+        billing_file
+    )
 
-@st.cache_data(show_spinner=False)
-def run_audit(billing_file, eta_file=None, mawb_text='', low_thr=.30, high_thr=.80) -> AuditResult:
-    margin_label = f'Margin<{int(low_thr*100)}% or >{int(high_thr*100)}%'
-    xls = pd.ExcelFile(billing_file)
-    sh = find_sheet_with_required_cols(xls, BILLING_REQUIRED)
-    if not sh:
-        raise ValueError('Could not find a billing sheet containing MAWB, Cost/AP, and Sell/AR.')
-    raw = pd.read_excel(xls, sheet_name=sh)
-    mcol = find_first_col(raw, BILLING_REQUIRED['MAWB'])
-    ccol = find_first_col(raw, BILLING_REQUIRED['Cost Amount'])
-    scol = find_first_col(raw, BILLING_REQUIRED['Sell Amount'])
-    clcol = find_first_col(raw, BILLING_OPTIONAL['Client'])
-    chcol = find_first_col(raw, BILLING_OPTIONAL['Charge Code'])
-    vcol = find_first_col(raw, BILLING_OPTIONAL['Vendor'])
+    # ========================================================
+    # 2. PROCARESX MERGE
+    # ========================================================
 
-    df = raw.copy()
-    df['MAWB'] = df[mcol].apply(normalize_mawb)
-    df['Original MAWB'] = df['MAWB']
-    df['Cost Amount'] = safe_numeric(df[ccol])
-    df['Sell Amount'] = safe_numeric(df[scol])
-    df['Client'] = _clean_text(df[clcol]) if clcol else 'UNKNOWN'
-    df['Charge Code'] = _clean_text(df[chcol]) if chcol else 'UNKNOWN'
-    df['Vendor'] = _clean_text(df[vcol]) if vcol else 'UNKNOWN'
-    df = df[df['MAWB'].ne('')].copy()
+    df, pro_mapping = (
+        _apply_procaresx_merge(
+            df
+        )
+    )
 
-    df, pro_map = _apply_procaresx_merge(df)
-    keep_raw = parse_mawb_list(mawb_text)
-    mawb_keep = sorted({pro_map.get(x,x) for x in keep_raw})
-    if mawb_keep:
-        df = df[df['MAWB'].isin(mawb_keep)].copy()
-        not_found = sorted(set(mawb_keep) - set(df['MAWB'].unique()))
+    # ========================================================
+    # 3. OPTIONAL MAWB FILTER
+    # ========================================================
+
+    requested = parse_mawb_list(
+        mawb_text
+    )
+
+    requested = sorted({
+        pro_mapping.get(
+            x,
+            x
+        )
+        for x in requested
+    })
+
+    if requested:
+
+        df = df[
+            df["MAWB"].isin(
+                requested
+            )
+        ].copy()
+
+        missing = sorted(
+            set(requested)
+            -
+            set(df["MAWB"])
+        )
+
     else:
-        not_found = []
-    not_found_df = pd.DataFrame({'MAWB':not_found})
 
-    eta_map, eta_note = _read_eta(eta_file)
-    if eta_map is not None and not eta_map.empty:
-        eta_map['MAWB'] = eta_map['MAWB'].replace(pro_map)
-        eta_map = eta_map.groupby('MAWB',as_index=False).agg(ETA=('ETA','max'),Branch=('Branch','last'))
-        df = df.merge(eta_map,on='MAWB',how='left')
+        missing = []
+
+    # ========================================================
+    # 4. ETA / BRANCH
+    # ========================================================
+
+    eta, eta_note = _read_eta(
+        eta_file,
+        pro_mapping
+    )
+
+    if eta is not None:
+
+        df = df.merge(
+            eta,
+            on="MAWB",
+            how="left"
+        )
+
     else:
-        df['ETA'] = pd.NaT
-        df['Branch'] = ''
-    df['ETA'] = pd.to_datetime(df['ETA'],errors='coerce').dt.normalize()
-    df['Branch'] = df['Branch'].fillna('').astype(str).str.strip()
 
-    df = _apply_hancai_allocation(df)
-    df['Line Profit'] = df['Sell Amount'] - df['Cost Amount']
-    code_map = _active_codes(df)
+        df["ETA"] = pd.NaT
+        df["Branch"] = ""
 
-    summary = df.groupby('MAWB',as_index=False).agg(Client=('Client','first'),Branch=('Branch','first'),Total_Cost=('Cost Amount','sum'),Total_Sell=('Sell Amount','sum'),Line_Count=('MAWB','size'),ETA=('ETA','max'))
-    summary['ETA Month'] = summary['ETA'].dt.to_period('M').astype(str).replace('NaT','')
-    summary['Profit'] = summary['Total_Sell'] - summary['Total_Cost']
-    summary['Profit Margin %'] = pct(summary['Profit'], summary['Total_Sell'])
-    cls = summary.apply(lambda r:_classify(r,code_map.get(r['MAWB'],set()),low_thr,high_thr),axis=1,result_type='expand')
-    cls.columns = ['Margin_Flag','Classification','Exception_Type']
-    summary = pd.concat([summary,cls],axis=1)
-    flags = summary[['MAWB','Margin_Flag','Classification','Exception_Type']]
-    exceptions = summary[summary['Classification'].eq('Open')].copy().sort_values(['Exception_Type','Profit','MAWB'])
+    # ========================================================
+    # 5. HANCAIWUX AR ALLOCATION
+    # ========================================================
 
-    client_summary = df.groupby('Client',as_index=False).agg(Total_Cost=('Cost Amount','sum'),Total_Sell=('Sell Amount','sum'),Line_Count=('Client','size'),MAWB_Count=('MAWB',pd.Series.nunique),Latest_ETA=('ETA','max'))
-    client_summary['Profit'] = client_summary['Total_Sell'] - client_summary['Total_Cost']
-    client_summary['Profit Margin %'] = pct(client_summary['Profit'],client_summary['Total_Sell'])
-    client_summary = client_summary.sort_values('Profit',ascending=False)
+    df = _apply_hancai_allocation(
+        df
+    )
 
-    margin_outliers = summary[summary['Exception_Type'].str.startswith('Margin',na=False)].copy().sort_values('Profit Margin %')
-    negative_profit = summary[summary['Profit'].lt(0)].copy().sort_values('Profit')
-    zero_margin = summary[summary['Profit Margin %'].eq(0)].copy().sort_values(['Total_Sell','Total_Cost'],ascending=False)
-    zero_profit = summary[summary['Profit'].eq(0)].copy().sort_values(['Total_Sell','Total_Cost'],ascending=False)
-    both_zero = summary[summary['Total_Sell'].eq(0)&summary['Total_Cost'].eq(0)].copy().sort_values('MAWB')
-    sell_zero_only = summary[summary['Total_Sell'].eq(0)&summary['Total_Cost'].gt(0)].copy().sort_values('Total_Cost',ascending=False)
-    cost_zero_only = summary[summary['Total_Cost'].eq(0)&summary['Total_Sell'].gt(0)].copy().sort_values('Total_Sell',ascending=False)
+    # ========================================================
+    # 6. LINE PROFIT
+    # ========================================================
 
-    cc = df.groupby('Charge Code',as_index=False).agg(Total_Cost=('Cost Amount','sum'),Total_Sell=('Sell Amount','sum'),Profit=('Line Profit','sum'),Line_Count=('Charge Code','size'),MAWB_Count=('MAWB',pd.Series.nunique))
-    neg_counts = df.assign(_neg=df['Line Profit'].lt(0)).groupby('Charge Code',as_index=False).agg(**{'Profit<0':('_neg','sum')})
-    cc = cc.merge(neg_counts,on='Charge Code',how='left').merge(_pivot(df[['MAWB','Charge Code']],'Charge Code',flags),on='Charge Code',how='left').fillna(0).sort_values('Profit',ascending=False)
+    df["Line Profit"] = (
+        df["Sell Amount"]
+        -
+        df["Cost Amount"]
+    )
 
-    vendor = df.groupby('Vendor',as_index=False).agg(Total_Cost=('Cost Amount','sum'),Total_Sell=('Sell Amount','sum'),Profit=('Line Profit','sum'),Line_Count=('Vendor','size'),MAWB_Count=('MAWB',pd.Series.nunique))
-    vendor = vendor.merge(_pivot(df[['MAWB','Vendor']],'Vendor',flags),on='Vendor',how='left').fillna(0).sort_values('Profit',ascending=False)
+    # ========================================================
+    # 7. ACTIVE CHARGE CODES
+    # ========================================================
 
-    cc_mawb = df.groupby(['MAWB','Charge Code'],as_index=False).agg(Client=('Client','first'),Vendor=('Vendor','first'),Branch=('Branch','first'),Total_Cost=('Cost Amount','sum'),Total_Sell=('Sell Amount','sum'),ETA=('ETA','max'))
-    cc_mawb['Profit'] = cc_mawb['Total_Sell'] - cc_mawb['Total_Cost']
-    cc_mawb['Profit Margin %'] = pct(cc_mawb['Profit'],cc_mawb['Total_Sell'])
-    cc_mawb['ETA Month'] = pd.to_datetime(cc_mawb['ETA'],errors='coerce').dt.to_period('M').astype(str).replace('NaT','')
-    def cc_exc(r):
-        if r['Profit'] >= 0:
+    codes_by_mawb = (
+        _active_codes(df)
+    )
+
+    # ========================================================
+    # 8. MAWB SUMMARY
+    # ========================================================
+
+    summary = (
+        df.groupby(
+            "MAWB",
+            as_index=False
+        )
+        .agg(
+            Client=(
+                "Client",
+                "first"
+            ),
+            Branch=(
+                "Branch",
+                "first"
+            ),
+            Total_Cost=(
+                "Cost Amount",
+                "sum"
+            ),
+            Total_Sell=(
+                "Sell Amount",
+                "sum"
+            ),
+            Line_Count=(
+                "MAWB",
+                "size"
+            ),
+            ETA=(
+                "ETA",
+                "max"
+            )
+        )
+    )
+
+    summary["Profit"] = (
+        summary["Total_Sell"]
+        -
+        summary["Total_Cost"]
+    )
+
+    summary[
+        "Profit Margin %"
+    ] = pct(
+        summary["Profit"],
+        summary["Total_Sell"]
+    )
+
+    # ========================================================
+    # 9. CLASSIFICATION
+    # ========================================================
+
+    flags = summary.apply(
+        lambda r: _classify(
+            r,
+            codes_by_mawb.get(
+                r["MAWB"],
+                set()
+            ),
+            low_thr,
+            high_thr
+        ),
+        axis=1,
+        result_type="expand"
+    )
+
+    flags.columns = [
+        "Margin_Flag",
+        "Classification",
+        "Exception_Type"
+    ]
+
+    summary = pd.concat(
+        [
+            summary,
+            flags
+        ],
+        axis=1
+    )
+
+    # ========================================================
+    # 10. EXCEPTION TABS
+    # ========================================================
+
+    exceptions = summary[
+        summary[
+            "Classification"
+        ].eq("Open")
+    ].copy()
+
+    negative_profit = summary[
+        summary["Profit"].lt(0)
+    ].copy()
+
+    zero_margin = summary[
+        summary[
+            "Profit Margin %"
+        ].eq(0)
+    ].copy()
+
+    zero_profit = summary[
+        summary["Profit"].eq(0)
+    ].copy()
+
+    both_zero = summary[
+        summary["Total_Cost"].eq(0)
+        &
+        summary["Total_Sell"].eq(0)
+    ].copy()
+
+    sell_zero_only = summary[
+        summary["Total_Sell"].eq(0)
+        &
+        summary["Total_Cost"].gt(0)
+    ].copy()
+
+    cost_zero_only = summary[
+        summary["Total_Cost"].eq(0)
+        &
+        summary["Total_Sell"].gt(0)
+    ].copy()
+
+    margin_outliers = summary[
+        summary[
+            "Exception_Type"
+        ].str.startswith(
+            "Margin",
+            na=False
+        )
+    ].copy()
+
+    # ========================================================
+    # 11. CLIENT SUMMARY
+    # ========================================================
+
+    client_summary = (
+        df.groupby(
+            "Client",
+            as_index=False
+        )
+        .agg(
+            Total_Cost=(
+                "Cost Amount",
+                "sum"
+            ),
+            Total_Sell=(
+                "Sell Amount",
+                "sum"
+            ),
+            MAWB_Count=(
+                "MAWB",
+                pd.Series.nunique
+            ),
+            Line_Count=(
+                "Client",
+                "size"
+            )
+        )
+    )
+
+    client_summary["Profit"] = (
+        client_summary[
+            "Total_Sell"
+        ]
+        -
+        client_summary[
+            "Total_Cost"
+        ]
+    )
+
+    client_summary[
+        "Profit Margin %"
+    ] = pct(
+        client_summary["Profit"],
+        client_summary[
+            "Total_Sell"
+        ]
+    )
+
+    # ========================================================
+    # 12. CHARGE CODE SUMMARY
+    # ========================================================
+
+    chargecode_summary = (
+        df.groupby(
+            "Charge Code",
+            as_index=False
+        )
+        .agg(
+            Total_Cost=(
+                "Cost Amount",
+                "sum"
+            ),
+            Total_Sell=(
+                "Sell Amount",
+                "sum"
+            ),
+            Profit=(
+                "Line Profit",
+                "sum"
+            ),
+            MAWB_Count=(
+                "MAWB",
+                pd.Series.nunique
+            ),
+            Line_Count=(
+                "Charge Code",
+                "size"
+            )
+        )
+    )
+
+    neg_counts = (
+        df.assign(
+            _neg=df[
+                "Line Profit"
+            ].lt(0)
+        )
+        .groupby(
+            "Charge Code",
+            as_index=False
+        )["_neg"]
+        .sum()
+        .rename(
+            columns={
+                "_neg": "Profit<0"
+            }
+        )
+    )
+
+    chargecode_summary = (
+        chargecode_summary.merge(
+            neg_counts,
+            on="Charge Code",
+            how="left"
+        )
+    )
+
+    # ========================================================
+    # 13. VENDOR SUMMARY
+    # ========================================================
+
+    vendor_summary = (
+        df.groupby(
+            "Vendor",
+            as_index=False
+        )
+        .agg(
+            Total_Cost=(
+                "Cost Amount",
+                "sum"
+            ),
+            Total_Sell=(
+                "Sell Amount",
+                "sum"
+            ),
+            Profit=(
+                "Line Profit",
+                "sum"
+            ),
+            MAWB_Count=(
+                "MAWB",
+                pd.Series.nunique
+            ),
+            Line_Count=(
+                "Vendor",
+                "size"
+            )
+        )
+    )
+
+    # ========================================================
+    # 14. CHARGE CODE PROFIT < 0
+    #
+    # Uses the SAME processed DF:
+    #
+    # PROCARESX merge already applied
+    # HANCAIWUX allocation already applied
+    # ========================================================
+
+    cc = (
+        df.groupby(
+            [
+                "MAWB",
+                "Charge Code"
+            ],
+            as_index=False
+        )
+        .agg(
+            Client=(
+                "Client",
+                "first"
+            ),
+            Vendor=(
+                "Vendor",
+                "first"
+            ),
+            Branch=(
+                "Branch",
+                "first"
+            ),
+            Total_Cost=(
+                "Cost Amount",
+                "sum"
+            ),
+            Total_Sell=(
+                "Sell Amount",
+                "sum"
+            ),
+            ETA=(
+                "ETA",
+                "max"
+            )
+        )
+    )
+
+    cc["Profit"] = (
+        cc["Total_Sell"]
+        -
+        cc["Total_Cost"]
+    )
+
+    cc[
+        "Profit Margin %"
+    ] = pct(
+        cc["Profit"],
+        cc["Total_Sell"]
+    )
+
+    # ========================================================
+    # CHARGE CODE PROFIT<0 RULE
+    # ========================================================
+
+    def cc_exception(r):
+
+        if r["Profit"] >= 0:
             return False
-        code, client, profit = str(r['Charge Code']).upper(), str(r['Client']).upper(), float(r['Profit'])
-        if code == 'TISC':
-            return profit < -10
-        if client == 'WHALECBOS' and code in {'TABD','DSTOR','TISC'}:
-            return profit < -10
+
+        code = r[
+            "Charge Code"
+        ]
+
+        client = r[
+            "Client"
+        ]
+
+        # TISC:
+        # only profit < -10
+
+        if code == "TISC":
+
+            return (
+                r["Profit"] < -10
+            )
+
+        # WHALECBOS:
+        # TABD / DSTOR / TISC
+        # only profit < -10
+
+        if (
+            client == "WHALECBOS"
+            and code in {
+                "TABD",
+                "DSTOR",
+                "TISC"
+            }
+        ):
+
+            return (
+                r["Profit"] < -10
+            )
+
+        # Other negative profit
         return True
-    cc_neg = cc_mawb[cc_mawb.apply(cc_exc,axis=1)].copy()
-    cc_neg['Exception_Type']='Profit<0'; cc_neg['Margin_Flag']='Exception'; cc_neg['Classification']='Open'
-    cc_neg = cc_neg.sort_values(['Profit','MAWB','Charge Code'])
 
-    total = len(summary); exc_count = int(summary['Margin_Flag'].eq('Exception').sum()); exempt_count = int(summary['Margin_Flag'].eq('Exempt').sum()); normal_count = int(summary['Margin_Flag'].eq('Normal').sum())
-    total_cost = float(summary['Total_Cost'].sum()); total_sell = float(summary['Total_Sell'].sum()); total_profit = float(summary['Profit'].sum()); overall_pm = total_profit/total_sell if total_sell else 0
-    neg_count = int(summary['Profit'].lt(0).sum()); neg_amount = float(summary.loc[summary['Profit'].lt(0),'Profit'].sum()); neg_ratio = neg_count/total if total else 0
-    metrics = {
-        'Total MAWB':total,'Exception Count':exc_count,'Exception %':exc_count/total if total else 0,
-        'Exempt Count':exempt_count,'Exempt %':exempt_count/total if total else 0,
-        'Normal Count':normal_count,'Normal %':normal_count/total if total else 0,
-        'Revenue=0 Count':int(summary['Exception_Type'].eq('Revenue=0').sum()),
-        'Cost=0 Count':int(summary['Exception_Type'].eq('Cost=0').sum()),
-        'Cost=Sell=0 Count':int(summary['Exception_Type'].eq('Cost=Sell=0').sum()),
-        'Profit<0 Count':neg_count,
-        'Margin<30% Count':int(summary['Exception_Type'].eq(f'Margin<{int(low_thr*100)}%').sum()),
-        'Margin>35% Count':int(summary['Exception_Type'].eq('Margin>35%').sum()),
-        'Margin>80% Count':int(summary['Exception_Type'].eq(f'Margin>{int(high_thr*100)}%').sum()),
-        'Total Cost':total_cost,'Total Sell':total_sell,'Total Profit':total_profit,'Overall Profit Margin %':overall_pm,
-    }
-    kpi = _kpi(metrics,{'Exception %','Exempt %','Normal %','Overall Profit Margin %'})
-    neg_summary = pd.DataFrame([{'Metric':'Profit < 0 Count','Value':neg_count},{'Metric':'Profit < 0 Total Amount','Value':neg_amount},{'Metric':'Profit < 0 % of MAWBs','Value':format_pct_str(neg_ratio)}])
+    chargecode_profit_lt0_mawb = (
+        cc[
+            cc.apply(
+                cc_exception,
+                axis=1
+            )
+        ]
+        .copy()
+    )
 
-    return AuditResult(mawb_keep,not_found,not_found_df,eta_note,kpi,neg_summary,df,summary,exceptions,client_summary,margin_outliers,negative_profit,zero_margin,zero_profit,both_zero,sell_zero_only,cost_zero_only,cc,vendor,cc_neg,margin_label,
-        display_df(summary,['ETA']),display_df(exceptions,['ETA']),display_df(client_summary,['Latest_ETA']),display_df(margin_outliers,['ETA']),display_df(negative_profit,['ETA']),display_df(zero_margin,['ETA']),display_df(zero_profit,['ETA']),display_df(both_zero,['ETA']),display_df(sell_zero_only,['ETA']),display_df(cost_zero_only,['ETA']),display_df(cc),display_df(vendor),display_df(cc_neg,['ETA']))
+    # Only Exception rows
+
+    chargecode_profit_lt0_mawb[
+        "Exception_Type"
+    ] = "Profit<0"
+
+    chargecode_profit_lt0_mawb[
+        "Margin_Flag"
+    ] = "Exception"
+
+    chargecode_profit_lt0_mawb[
+        "Classification"
+    ] = "Open"
+
+    # ========================================================
+    # 15. KPI
+    # ========================================================
+
+    total_mawb = len(
+        summary
+    )
+
+    exc = int(
+        summary[
+            "Margin_Flag"
+        ].eq(
+            "Exception"
+        ).sum()
+    )
+
+    exempt = int(
+        summary[
+            "Margin_Flag"
+        ].eq(
+            "Exempt"
+        ).sum()
+    )
+
+    normal = int(
+        summary[
+            "Margin_Flag"
+        ].eq(
+            "Normal"
+        ).sum()
+    )
+
+    total_cost = float(
+        summary[
+            "Total_Cost"
+        ].sum()
+    )
+
+    total_sell = float(
+        summary[
+            "Total_Sell"
+        ].sum()
+    )
+
+    total_profit = float(
+        summary[
+            "Profit"
+        ].sum()
+    )
+
+    overall_margin = (
+        total_profit / total_sell
+        if total_sell
+        else 0
+    )
+
+    kpi_vertical = pd.DataFrame(
+        [
+            [
+                "Total MAWB",
+                total_mawb
+            ],
+            [
+                "Exception Count",
+                exc
+            ],
+            [
+                "Exempt Count",
+                exempt
+            ],
+            [
+                "Normal Count",
+                normal
+            ],
+            [
+                "Total Cost",
+                total_cost
+            ],
+            [
+                "Total Sell",
+                total_sell
+            ],
+            [
+                "Total Profit",
+                total_profit
+            ],
+            [
+                "Overall Profit Margin %",
+                f"{overall_margin:.2%}"
+            ]
+        ],
+        columns=[
+            "Metric",
+            "Value"
+        ]
+    )
+
+    # ========================================================
+    # NEGATIVE KPI
+    # ========================================================
+
+    neg_summary = pd.DataFrame(
+        [
+            [
+                "Profit < 0 Count",
+                int(
+                    summary[
+                        "Profit"
+                    ].lt(0).sum()
+                )
+            ],
+            [
+                "Profit < 0 Total Amount",
+                float(
+                    summary.loc[
+                        summary[
+                            "Profit"
+                        ].lt(0),
+                        "Profit"
+                    ].sum()
+                )
+            ]
+        ],
+        columns=[
+            "Metric",
+            "Value"
+        ]
+    )
+
+    # ========================================================
+    # RETURN
+    # ========================================================
+
+    return AuditResult(
+
+        requested,
+
+        pd.DataFrame(
+            {
+                "MAWB": missing
+            }
+        ),
+
+        eta_note,
+
+        kpi_vertical,
+        neg_summary,
+
+        df,
+        summary,
+        exceptions,
+        client_summary,
+        margin_outliers,
+        negative_profit,
+        zero_margin,
+        zero_profit,
+        both_zero,
+        sell_zero_only,
+        cost_zero_only,
+        chargecode_summary,
+        vendor_summary,
+        chargecode_profit_lt0_mawb,
+
+        display_df(
+            summary,
+            ["ETA"]
+        ),
+
+        display_df(
+            exceptions,
+            ["ETA"]
+        ),
+
+        display_df(
+            client_summary
+        ),
+
+        display_df(
+            margin_outliers,
+            ["ETA"]
+        ),
+
+        display_df(
+            negative_profit,
+            ["ETA"]
+        ),
+
+        display_df(
+            zero_margin,
+            ["ETA"]
+        ),
+
+        display_df(
+            zero_profit,
+            ["ETA"]
+        ),
+
+        display_df(
+            both_zero,
+            ["ETA"]
+        ),
+
+        display_df(
+            sell_zero_only,
+            ["ETA"]
+        ),
+
+        display_df(
+            cost_zero_only,
+            ["ETA"]
+        ),
+
+        display_df(
+            chargecode_summary
+        ),
+
+        display_df(
+            vendor_summary
+        ),
+
+        display_df(
+            chargecode_profit_lt0_mawb,
+            ["ETA"]
+        )
+    )
